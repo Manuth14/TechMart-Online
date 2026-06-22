@@ -5,11 +5,11 @@
              version="3.0">
 
     <persistence-unit name="TechMartPU" transaction-type="JTA">
-        <jta-data-source>jdbc/TechMartDS</jta-data-source>
+        <jta-data-source>jdbc/TechMart</jta-data-source>
 
         <properties>
             <property name="hibernate.dialect" value="org.hibernate.dialect.MySQL8Dialect"/>
-            <property name="jakarta.persistence.schema-generation.database.action" value="update"/>
+            <property name="hibernate.hbm2ddl.auto" value="update"/>
             <property name="hibernate.show_sql" value="true"/>
             <property name="hibernate.format_sql" value="true"/>
         </properties>
