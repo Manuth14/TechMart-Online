@@ -8,11 +8,12 @@
     <artifactId>techmart</artifactId>
     <version>1.0</version>
     <packaging>pom</packaging>
+
     <modules>
         <module>techmart-ejb</module>
-        <module>techmart-ear</module>
-        <module>techmart-web</module>
         <module>techmart-core</module>
+        <module>techmart-web</module>
+        <module>techmart-ear</module>
     </modules>
 
     <properties>
