@@ -1,17 +1,17 @@
 package lk.techmart.ejb.bean;
 
-import jakarta.ejb.EJB;
-import jakarta.ejb.Stateless;
+import jakarta.ejb.*;
 import jakarta.jms.*;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
+import lk.techmart.core.DTO.CartItemDTO;
 import lk.techmart.core.DTO.InventoryDTO;
 import lk.techmart.core.DTO.OrderDTO;
 import lk.techmart.core.service.InventoryService;
+import lk.techmart.core.service.InvoiceService;
 import lk.techmart.core.service.OrderService;
 import lk.techmart.ejb.entity.Orders;
 import org.apache.activemq.ActiveMQConnectionFactory;
-import org.apache.activemq.ScheduledMessage;
 
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -25,76 +25,135 @@ public class OrderBean implements OrderService {
     @PersistenceContext(unitName = "TechMartPU")
     private EntityManager entityManager;
 
-    @EJB // 🎯 Interface එක හරහා Inject කරගන්නවා
+    @EJB
     private InventoryService inventoryBean;
 
+    @EJB
+    private InvoiceService invoiceService;
+
+    // ===================================================================
+    // 🔥 1. AUTOMATED ASYNCHRONOUS CART-BASED ORDER PROCESSING PIPELINE
+    // ===================================================================
     @Override
-    public void saveOrder(OrderDTO orderDTO) {
+    @Asynchronous // 🎯 සර්වර් එකේ background thread pool එකෙන් දුවන්න සෙට් කළා
+    @TransactionAttribute(TransactionAttributeType.REQUIRED) // 🛡️ එකක් හරි ෆේල් වුණොත් මුළු Parent/Child ටේබල් දෙකම Rollback වෙයි
+    public void processOrderAsync(List<CartItemDTO> items, String userEmail) {
+        System.out.println("⏳ [Async Cart Order] Pipeline started in background for: " + userEmail);
+
         try {
-            // 1. Inventory එකෙන් Product DTO එක ගන්නවා
-            InventoryDTO inventoryDTO = inventoryBean.getProductById(orderDTO.getProductId());
-            if (inventoryDTO == null) {
-                throw new RuntimeException("Product Not Found!");
-            }
+            // A. 🆔 මුළු කාර්ට් එකටම පොදු Unique Master Order ID එකක් සාදා ගැනීම
+            String mainOrderId = "ORD-" + System.currentTimeMillis() + "-" + (int)(Math.random() * 1000);
 
-            // 2. ස්ටොක් ඇතිද බලනවා
-            if (inventoryDTO.getStockQuantity() < orderDTO.getQuantity()) {
-                throw new RuntimeException("Insufficient stock!");
-            }
-
-            // 3. ස්ටොක් අඩු කරලා ඩේටාබේස් එක Update කරනවා
-            int currentStock = inventoryDTO.getStockQuantity();
-            inventoryDTO.setStockQuantity(currentStock - orderDTO.getQuantity());
-            inventoryBean.updateInventory(inventoryDTO);
-
-            // 4. Orders Entity එකක් හදලා DB එකට ලියනවා
+            // B. 📑 Parent Record: 'orders' ටේබල් එකට මුලින්ම එක Row එකක් සේව් කරනවා
             Orders entityOrder = new Orders();
-            entityOrder.setOrderId(orderDTO.getOrderId());
-            entityOrder.setUserEmail(orderDTO.getEmail());
-            entityOrder.setProductId(orderDTO.getProductId());
-            entityOrder.setQuantity(orderDTO.getQuantity());
+            entityOrder.setOrderId(mainOrderId);
+            entityOrder.setUserEmail(userEmail);
+            // entityOrder.setStatus("PROCESSED"); // ඔයාගේ Entity එකේ status/date තිබේ නම් සෙට් කරන්න මල්ලි
+
             entityManager.persist(entityOrder);
+            System.out.println("💾 [Async Order] Master Order record saved. ID: " + mainOrderId);
 
-            ActiveMQConnectionFactory connectionFactory = new ActiveMQConnectionFactory("tcp://localhost:61616");
+            // C. 🛍️ Child Records: කාර්ට් එකේ තියෙන හැම අයිටම් එකක්ම ලූප් කරලා 'order_items' එකට දානවා
+            for (CartItemDTO item : items) {
 
-            try{
-                Connection connection = connectionFactory.createConnection();
-                connection.start();
+                // ⚡ i. DB Atomic Stock Update (Race Condition එක ඩේටාබේස් ලෙවල් එකෙන්ම බ්ලොක් කරයි)
+                boolean isReduced = inventoryBean.reduceStock(item.getProductId(), item.getQuantity());
 
-                Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
-                Queue queue = session.createQueue("OrderNotificationQueue");
+                if (!isReduced) {
+                    // ස්ටොක් මදි නම් RuntimeException එකක් ගහනවා.
+                    // එතකොට උඩ දාපු Parent Order එකත් එක්කම මුළු ට්‍රාන්සැක්ෂන් එකම ඩේටාබේස් එකෙන් Rollback වෙනවා! 🛡️
+                    throw new RuntimeException("Insufficient stock for Product ID: " + item.getProductId() + ". Transaction Rollbacked!");
+                }
 
-                MessageProducer producer = session.createProducer(queue);
-                TextMessage textMessage = session.createTextMessage("Notification Request for Order: " + orderDTO.getOrderId() + " | Customer: " + orderDTO.getEmail());
+                // 💾 ii. OrderItems Entity එකක් හදලා DB එකට ලියනවා
+                OrderDTO entityItem = new OrderDTO();
+                entityItem.setOrderId(mainOrderId); // 🔗 Parent Order එකට ලින්ක් කළා
+                entityItem.setProductId(item.getProductId());
+                entityItem.setQuantity(item.getQuantity());
+                // entityItem.setUnitPrice(item.getPrice()); // ඔයාගේ Entity එකේ මිල සේව් කරන්න ෆීල්ඩ් එකක් ඇති නම් දාන්න
 
-                producer.send(textMessage);
-                System.out.println("📨 JMS Message sent to ActiveMQ Queue!");
+                entityManager.persist(entityItem);
 
-            } catch (JMSException e) {
-                throw new RuntimeException(e);
+                // 📨 iii. JMS Message Production to ActiveMQ Queue
+                triggerJMSNotification(mainOrderId, userEmail);
+
+                // 🔄 iv. Live Stock Sync to Frontend
+                triggerLiveStockSync(item.getProductId());
             }
 
-            try {
-                HttpClient client = HttpClient.newHttpClient();
-                HttpRequest httpRequest = HttpRequest.newBuilder()
-                        .uri(java.net.URI.create("http://localhost:8080/techmart-web/sync-stock-trigger?pid="
-                                + inventoryDTO.getProductId() + "&stock=" + inventoryDTO.getStockQuantity()))
-                        .GET()
-                        .build();
+            System.out.println("🚀 Triggering Asynchronous Invoice & Email Process...");
 
-                // බැක්ග්‍රවුන්ඩ් එකෙන් සර්ව්ලට් එක කෝල් වෙනවා (User ට දැනෙන්නෙවත් නැහැ)
-                client.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofString());
+            // ⚡ D. Invoice Generator Thread එක රන් කිරීම
+            java.util.concurrent.Future<Boolean> asyncResult = invoiceService.generateInvoiceAndEmail(mainOrderId, userEmail);
 
-            } catch (Exception ex) {
-                ex.printStackTrace();
-            }
+            System.out.println("✅ [Async Cart Order] Complete batch processing finished successfully for: " + userEmail);
 
         } catch (Exception e) {
-            e.printStackTrace();
-            throw new RuntimeException(e); // Rollback වෙන්න අනිවාර්යයි
+            System.err.println("🚨 [Async Order FAILED] Transaction Rollback triggered: " + e.getMessage());
+            throw new RuntimeException(e); // 🛑 Container-Managed Transaction එක නිසා ටේබල් දෙකම ඔටෝම Rollback වෙනවා
         }
     }
 
+    // ===================================================================
+    // 💾 2. SINGLE ORDER SAVE (පරණ මෙතඩ් එක - BACKWARD COMPATIBILITY)
+    // ===================================================================
+    @Override
+    @TransactionAttribute(TransactionAttributeType.REQUIRED)
+    public void saveOrder(OrderDTO orderDTO) {
+        // තනි අයිටම් එකක් ආවොත්, ඒකත් අපේ ප්‍රධාන පයිප්ලයින් එකටම ලිස්ට් එකක් විදිහට හරවලා යවනවා මල්ලි
+        List<CartItemDTO> singleItemList = new ArrayList<>();
+        CartItemDTO item = new CartItemDTO();
+        item.setProductId(orderDTO.getProductId());
+        item.setQuantity(orderDTO.getQuantity());
+        singleItemList.add(item);
+
+        this.processOrderAsync(singleItemList, orderDTO.getEmail());
+    }
+
+    // ===================================================================
+    // 🔍 HELPER METHODS FOR JMS & STOCK SYNC
+    // ===================================================================
+    private void triggerJMSNotification(String orderId, String email) {
+        try {
+            ActiveMQConnectionFactory connectionFactory = new ActiveMQConnectionFactory("tcp://localhost:61616");
+            Connection connection = connectionFactory.createConnection();
+            connection.start();
+
+            Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            Queue queue = session.createQueue("OrderNotificationQueue");
+
+            MessageProducer producer = session.createProducer(queue);
+            TextMessage textMessage = session.createTextMessage("Notification Request for Order: " + orderId + " | Customer: " + email);
+
+            producer.send(textMessage);
+            System.out.println("📨 JMS Message sent to ActiveMQ Queue!");
+            connection.close();
+        } catch (JMSException e) {
+            System.err.println("❌ JMS Error: " + e.getMessage());
+        }
+    }
+
+    private void triggerLiveStockSync(String productId) {
+        try {
+            InventoryDTO updatedInventory = inventoryBean.getProductById(productId);
+            if (updatedInventory != null) {
+                HttpClient client = HttpClient.newHttpClient();
+                HttpRequest httpRequest = HttpRequest.newBuilder()
+                        .uri(java.net.URI.create("http://localhost:8080/techmart-web/sync-stock-trigger?pid="
+                                + updatedInventory.getProductId() + "&stock=" + updatedInventory.getStockQuantity()))
+                        .GET()
+                        .build();
+
+                client.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofString());
+            }
+        } catch (Exception ex) {
+            System.err.println("❌ Sync Stock Trigger Failed: " + ex.getMessage());
+        }
+    }
+
+    // ===================================================================
+    // 🔍 FETCH LOOKUP METHODS
+    // ===================================================================
     @Override
     public OrderDTO getOrderById(String orderId) {
         Orders entityOrder = entityManager.find(Orders.class, orderId);
@@ -103,8 +162,8 @@ public class OrderBean implements OrderService {
         OrderDTO dto = new OrderDTO();
         dto.setOrderId(entityOrder.getOrderId());
         dto.setEmail(entityOrder.getUserEmail());
-        dto.setProductId(entityOrder.getProductId());
-        dto.setQuantity(entityOrder.getQuantity());
+        // සටහන: ටේබල් දෙකක් නිසා Product/Qty විස්තර එන්නේ order_items එකෙන්.
+        // දැනට පරණ ඩීටීඕ එක ක්‍රෑෂ් නොවී දුවන්න මෙතන මෙහෙම තිබ්බාම ඇති මල්ලි.
         return dto;
     }
 
@@ -117,8 +176,6 @@ public class OrderBean implements OrderService {
             OrderDTO dto = new OrderDTO();
             dto.setOrderId(entityOrder.getOrderId());
             dto.setEmail(entityOrder.getUserEmail());
-            dto.setProductId(entityOrder.getProductId());
-            dto.setQuantity(entityOrder.getQuantity());
             dtoList.add(dto);
         }
         return dtoList;

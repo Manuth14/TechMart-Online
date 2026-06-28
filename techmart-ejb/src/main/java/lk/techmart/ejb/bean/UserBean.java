@@ -1,20 +1,42 @@
 package lk.techmart.ejb.bean;
 
+import jakarta.annotation.Resource;
 import jakarta.ejb.Stateless;
-import jakarta.persistence.EntityManager;
-import jakarta.persistence.PersistenceContext;
-import lk.techmart.ejb.entity.Users;
+import javax.sql.DataSource;
+import lk.techmart.core.service.UserService;
 
-import java.util.List;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 
 @Stateless
-public class UserBean {
+public class UserBean implements UserService {
 
-    @PersistenceContext(unitName = "TechMartPU") // persistence.xml එකේ තියෙන නම
-    private EntityManager em;
+    @Resource(lookup = "jdbc/TechMart")
+    private DataSource dataSource;
 
-    // ඩේටාබේස් එකේ ඉන්න ඔක්කොම Users ලාව අරන් එන මෙතඩ් එක
-    public List<Users> getAllUsers() {
-        return em.createQuery("SELECT u FROM Users u", Users.class).getResultList();
+    @Override
+    public boolean validateUser(String email, String password) {
+        // 🔍 users table (email, password) එක චෙක් කරන SQL එක
+        String query = "SELECT email FROM users WHERE email = ? AND password = ?";
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(query)) {
+
+            ps.setString(1, email);
+            ps.setString(2, password);
+
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    System.out.println("✅ [UserBean] Authentication Successful for: " + email);
+                    return true;
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("❌ [UserBean] DB Error during authentication: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return false;
     }
 }

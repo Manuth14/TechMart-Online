@@ -32,4 +32,7 @@ public class Inventory implements Serializable {
 
     @Column(name = "stockQuantity", nullable = false)
     private int stockQuantity;
+
+    @Column(name = "unitPrice", nullable = false)
+    private double unitPrice;
 }

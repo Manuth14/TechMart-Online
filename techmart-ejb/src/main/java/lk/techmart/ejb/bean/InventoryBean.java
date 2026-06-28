@@ -1,47 +1,115 @@
 package lk.techmart.ejb.bean;
 
-import jakarta.ejb.*;
-import jakarta.persistence.EntityManager;
-import jakarta.persistence.PersistenceContext;
+import jakarta.annotation.Resource;
+import jakarta.ejb.Stateless;
+import javax.sql.DataSource;
 import lk.techmart.core.DTO.InventoryDTO;
 import lk.techmart.core.service.InventoryService;
-import lk.techmart.ejb.entity.Inventory;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 
 @Stateless
 public class InventoryBean implements InventoryService {
 
-    @PersistenceContext(unitName = "TechMartPU")
-    private EntityManager entityManager;
+    @Resource(lookup = "jdbc/TechMart")
+    private DataSource dataSource;
+
+    @Override
+    public List<InventoryDTO> getAllProducts() {
+        List<InventoryDTO> productList = new ArrayList<>();
+        String query = "SELECT productId, product_name, stockQuantity, unitPrice FROM inventory";
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(query);
+             ResultSet rs = ps.executeQuery()) {
+
+            while (rs.next()) {
+                InventoryDTO product = new InventoryDTO(
+                        rs.getString("productId"),
+                        rs.getString("product_name"),
+                        rs.getInt("stockQuantity"),
+                        rs.getDouble("unitPrice")
+                );
+                productList.add(product);
+            }
+            System.out.println("📦 [InventoryBean] Loaded " + productList.size() + " products from DB.");
+
+        } catch (SQLException e) {
+            System.err.println("❌ [InventoryBean] Error in getAllProducts: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return productList;
+    }
 
     @Override
     public InventoryDTO getProductById(String productId) {
-        Inventory entity = entityManager.find(Inventory.class, productId);
-        if (entity == null) return null;
+        String query = "SELECT productId, product_name, stockQuantity, unitPrice FROM inventory WHERE productId = ?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(query)) {
 
-        return new InventoryDTO(entity.getProductId(), entity.getStockQuantity());
+            ps.setString(1, productId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new InventoryDTO(
+                            rs.getString("productId"),
+                            rs.getString("product_name"),
+                            rs.getInt("stockQuantity"),
+                            rs.getDouble("unitPrice")
+                    );
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("❌ [InventoryBean] Error in getProductById: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
     }
 
     @Override
     public void updateInventory(InventoryDTO inventoryDTO) {
-        Inventory entity = entityManager.find(Inventory.class, inventoryDTO.getProductId());
-        if (entity != null) {
-            // DTO එකෙන් එන අලුත් Qty එක Entity එකට දානවා
-            entity.setStockQuantity(inventoryDTO.getStockQuantity());
-            entityManager.merge(entity); // DB එකට සේව් වෙනවා
+        String query = "UPDATE inventory SET product_name = ?, stockQuantity = ?, unitPrice = ? WHERE productId = ?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(query)) {
+
+            ps.setString(1, inventoryDTO.getProduct_name());
+            ps.setInt(2, inventoryDTO.getStockQuantity());
+            ps.setDouble(3, inventoryDTO.getUnitPrice());
+            ps.setString(4, inventoryDTO.getProductId());
+
+            int rows = ps.executeUpdate();
+            System.out.println("🔄 [InventoryBean] Updated inventory for: " + inventoryDTO.getProductId() + " | Rows affected: " + rows);
+
+        } catch (SQLException e) {
+            System.err.println("❌ [InventoryBean] Error in updateInventory: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
     @Override
-    public List<InventoryDTO> getAllProducts() {
-        List<Inventory> entityList = entityManager.createQuery("SELECT i FROM Inventory i", Inventory.class).getResultList();
-        List<InventoryDTO> dtoList = new ArrayList<>();
+    public boolean reduceStock(String productId, int quantity) {
 
-        for (Inventory entity : entityList) {
-            dtoList.add(new InventoryDTO(entity.getProductId(), entity.getStockQuantity()));
+        String query = "UPDATE inventory SET stockQuantity = stockQuantity - ? WHERE productId = ? AND stockQuantity >= ?";
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(query)) {
+
+            ps.setInt(1, quantity);
+            ps.setString(2, productId);
+            ps.setInt(3, quantity);
+
+            int rowsUpdated = ps.executeUpdate();
+
+            return rowsUpdated > 0;
+
+        } catch (SQLException e) {
+            System.err.println("❌ [InventoryBean] SQL Error: " + e.getMessage());
+            e.printStackTrace();
+            return false;
         }
-        return dtoList;
     }
 }

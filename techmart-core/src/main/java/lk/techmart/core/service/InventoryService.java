@@ -9,5 +9,6 @@ import java.util.List;
 public interface InventoryService {
     InventoryDTO getProductById(String productId);
     void updateInventory(InventoryDTO inventoryDTO);
+    boolean reduceStock(String productId, int quantity);
     List<InventoryDTO> getAllProducts();
 }
